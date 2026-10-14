@@ -1,4 +1,23 @@
-# Making OmniRoute's OpenCode free-tier provider work
+> ### ⚠️ UPDATE (2026-10-14) — the session-mint fix below no longer works
+>
+> OpenCode hardened the free-tier gate. Direct requests to `opencode.ai` now
+> return 403 regardless of session id, org header, or bearer token. The gateway
+> only accepts free-tier requests **proxied through the local opencode server**.
+>
+> **The current working solution is the local shim — see
+> [`shim/README.md`](shim/README.md).** The content below is kept as a record of
+> the original fix and its root-cause analysis.
+>
+> Quick verification of the regression:
+>
+> ```
+> real session + real oc_sk key + x-opencode-org-id → opencode.ai  = 403
+> same model through local /api/session/{id}/prompt                = 200
+> ```
+>
+> ---
+
+# Making OmniRoute's OpenCode free-tier provider work (original fix, now superseded)
 
 This documents the full path from the original 403 to a working OpenCode
 free-tier provider inside [OmniRoute](https://github.com/diegosouzapw/OmniRoute), including every
