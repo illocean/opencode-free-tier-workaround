@@ -1,7 +1,7 @@
 # Making OmniRoute's OpenCode free-tier provider work
 
 This documents the full path from the original 403 to a working OpenCode
-free-tier provider inside [OmniRoute]([https://omniroute.dev](https://github.com/diegosouzapw/OmniRoute)), including every
+free-tier provider inside [OmniRoute](https://github.com/diegosouzapw/OmniRoute), including every
 mistake and dead end, with the exact scripts used.
 
 Two independent problems had to be solved:
