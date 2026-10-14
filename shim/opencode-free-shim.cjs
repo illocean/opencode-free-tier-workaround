@@ -74,14 +74,13 @@ async function mint() {
 }
 
 function splitModel(model) {
-  // Accept "opencode/mimo-v2.6-flash-free" or "mimo-v2.6-flash-free"
-  if (!model) return { providerID: 'opencode', id: 'mimo-v2.6-flash-free' };
-  const s = String(model);
-  if (s.includes('/')) {
-    const i = s.indexOf('/');
-    return { providerID: s.slice(0, i), id: s.slice(i + 1) };
-  }
-  return { providerID: 'opencode', id: s };
+  // Accept "<anyprefix>/mimo-v2.6-flash-free" or "mimo-v2.6-flash-free".
+  // The local API ALWAYS wants providerID="opencode"; any prefix the caller
+  // adds (OmniRoute applies its connection prefix, e.g. "ocfree/") is stripped.
+  let id = String(model || 'mimo-v2.6-flash-free');
+  if (id.includes('/')) id = id.slice(id.indexOf('/') + 1);
+  if (!id) id = 'mimo-v2.6-flash-free';
+  return { providerID: 'opencode', id };
 }
 
 function flattenMessages(messages) {
@@ -145,10 +144,13 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/v1/models') {
       // pull live free model list from local server
       const mb = await (await fetch(BASE() + '/api/model', { headers: H() })).json();
-      const list = (mb.data || mb).map(m => ({
-        id: (m.providerID ? m.providerID + '/' : '') + (m.id || m.modelID),
-        object: 'model', owned_by: m.providerID || 'opencode',
-      }));
+      // Strip the "opencode/" provider prefix from the id so OmniRoute applies
+      // the connection's own prefix (e.g. "ocfree/") cleanly, without collision
+      // against the builtin opencode provider's "oc/" namespace.
+      const list = (mb.data || mb).map(m => {
+        const bare = String(m.id || m.modelID || '').replace(/^opencode\//, '');
+        return { id: bare, object: 'model', owned_by: 'opencode' };
+      });
       return j(res, 200, { object: 'list', data: list });
     }
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
