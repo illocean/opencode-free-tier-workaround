@@ -27,6 +27,20 @@ Then in the OmniRoute dashboard:
 | API Key | anything, e.g. `local` |
 | Model | `opencode/mimo-v2.6-flash-free` |
 
+**Verified OmniRoute connection settings (what we actually used):**
+
+| Setting | Value |
+|---|---|
+| Provider slug | `openai-compatible-chat` |
+| Base URL | `http://127.0.0.1:8791/v1` |
+| API Key | any non-empty string |
+| Prefix | `ocfree` (cosmetic only — **not** used for routing) |
+| Call model as | `openai-compatible-chat/mimo-v2.6-flash-free` |
+
+**The routing key is the provider slug, not the prefix.** `ocfree/mimo-v2.6-flash-free`
+returns 401 because OmniRoute routes by `{provider-slug}/{model}`. Use
+`openai-compatible-chat/mimo-v2.6-flash-free` in your OmniRoute combo.
+
 Done. Free models work again.
 
 ---
@@ -75,8 +89,25 @@ OmniRoute's compiled chunks), this has:
 shim/
 ├── opencode-free-shim.cjs   the shim
 ├── test-shim.cjs            smoke test (health, models, chat)
+├── start-shim.cmd           launch (hidden window)
+├── launch-shim.cmd          launch + health check
+├── start-shim.vbs           autostart (no console window)
+├── autostart.sh             launch (Linux/macOS)
 └── README.md                this file
 ```
+
+## Autostart
+
+The shim must be running before OmniRoute needs it. On Windows, the simplest
+approach (no admin needed) is a Startup folder shortcut:
+
+```
+%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\OmniRoute OpenCode Shim.lnk
+  → runs start-shim.vbs
+  → node opencode-free-shim.cjs  (hidden window)
+```
+
+On Linux/macOS, run `shim/autostart.sh` from your session startup script.
 
 ---
 
@@ -118,8 +149,9 @@ API doesn't accept them. Streaming is emulated as a single non-streamed reply.
 - **There is no OpenAI surface on the local server.** `/openai/v1/...` returns
   the SPA HTML catch-all on GET and 405 on POST — don't point OmniRoute at it.
 - **The shim must keep running.** If OmniRoute can't reach it, opencode legs
-  will fail. Start it with the same autostart mechanism as OmninitRoute itself,
-  or use a startup shortcut.
+  will fail. It autostarts via a Startup folder shortcut
+  (`OmniRoute OpenCode Shim.lnk` → `start-shim.vbs`). If you removed the
+  shortcut, run `start-shim.cmd` manually.
 
 ---
 
