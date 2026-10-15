@@ -1,105 +1,109 @@
-// 07-add-shim-provider.cjs — wire the local shim into OmniRoute as a proper
-// OpenAI-compatible provider so it appears in /dashboard/providers?mode=configured.
+// 07-add-shim-provider.cjs — wire the local shim (shim/opencode-free-shim.cjs) into
+// OmniRoute so it shows up under /dashboard/providers?mode=configured and routes.
 //
-// Two DB mutations are needed because OmniRoute's PUT /api/providers/{id} cannot
-// change the `provider` field (immutable via API). This script uses better-sqlite3
-// directly against storage.sqlite (WAL mode — safe while server is running).
+// Three idempotent steps:
+//   1. find (or create) the provider_nodes row for the shim base url
+//   2. set provider_connections.provider = that node id — the dashboard's
+//      connectionMatchesProviderCard does an EXACT id match, so a connection
+//      left on the generic "openai-compatible-chat" slug never matches its card
+//   3. rewrite combo legs still pointing at the now-dead bare slug
+//      "openai-compatible-chat/<model>"
 //
-// What it does:
-//   1. Finds (or creates) the provider_nodes row for the shim
-//   2. Finds the shim connection (provider='openai-compatible-chat', baseUrl=shim)
-//   3. Sets connection.provider = node.id  → makes dashboard match it
-//   4. Fixes combo legs that still use the old bare-slug model ids
+// `provider` is not part of updateProviderConnectionSchema, so PUT /api/providers/{id}
+// cannot change it. A direct SQLite write is the only route. storage.sqlite is WAL,
+// so writing from a second process while the server runs is safe — no restart.
 //
-// Prereq: shim running (start-shim.cmd). Set OMNI_PW to override login password.
-const Database = require('better-sqlite3');
+// Usage: node 07-add-shim-provider.cjs            (apply)
+//        node 07-add-shim-provider.cjs --dry      (report only, opens readonly)
+//        OMNI_DB=... SHIM_BASE_URL=... node 07-add-shim-provider.cjs
 const path = require('path');
 const os = require('os');
 
-const SHIM_BASE = 'http://127.0.0.1:8791/v1';
-const NODE_PREFIX = 'ocfree';
+const DB_PATH = process.env.OMNI_DB || path.join(os.homedir(), '.omniroute', 'storage.sqlite');
+const SHIM_BASE = process.env.SHIM_BASE_URL || 'http://127.0.0.1:8791/v1';
 const NODE_NAME = 'oc-free-shim';
-const DB_PATH = path.join(os.homedir(), '.omniroute', 'storage.sqlite');
+const NODE_PREFIX = 'ocfree';
+const API_TYPE = 'chat';
+const LEGACY_SLUG = 'openai-compatible-chat';
+const DRY = process.argv.includes('--dry');
 
-const db = new Database(DB_PATH, { readonly: false });
+let Database;
+try {
+  Database = require('better-sqlite3');
+} catch {
+  Database = require(path.join(
+    process.env.APPDATA || '',
+    'npm/node_modules/omniroute/node_modules/better-sqlite3'));
+}
 
-// ── 1. find or create provider_nodes row ──────────────────────────────────
-let node = db.prepare(
-  `SELECT id, type, name, prefix, base_url, api_type FROM provider_nodes
-   WHERE name = ? OR prefix = ?`
-).get(NODE_NAME, NODE_PREFIX);
+const db = new Database(DB_PATH, { readonly: DRY });
 
+// ── 1. provider_nodes row ────────────────────────────────────────────────────
+let node = db
+  .prepare('SELECT id, name, prefix, base_url FROM provider_nodes WHERE base_url = ?')
+  .get(SHIM_BASE);
 if (!node) {
-  // generate id the same way the server does: openai-compatible-chat-{apiType}-{uuid}
-  const { randomUUID } = require('crypto');
-  const nodeId = 'openai-compatible-chat-chat-' + randomUUID();
+  // same id shape the server mints: openai-compatible-chat-{apiType}-{uuid}
+  const id = `${LEGACY_SLUG}-${API_TYPE}-${require('crypto').randomUUID()}`;
   const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO provider_nodes (id, type, name, prefix, api_type, base_url, created_at, updated_at)
-     VALUES (?, 'openai-compatible', ?, ?, 'chat', ?, ?, ?)`
-  ).run(nodeId, NODE_NAME, NODE_PREFIX, SHIM_BASE, now, now);
-  node = db.prepare(`SELECT id, type, name, prefix, base_url, api_type FROM provider_nodes WHERE id = ?`).get(nodeId);
-  console.log('created provider_nodes row:', nodeId);
+  if (!DRY) {
+    db.prepare(
+      `INSERT INTO provider_nodes (id, type, name, prefix, api_type, base_url, created_at, updated_at)
+       VALUES (?, 'openai-compatible', ?, ?, ?, ?, ?, ?)`
+    ).run(id, NODE_NAME, NODE_PREFIX, API_TYPE, SHIM_BASE, now, now);
+  }
+  node = { id, name: NODE_NAME, prefix: NODE_PREFIX, base_url: SHIM_BASE };
+  console.log(`${DRY ? 'would create' : 'created'} provider_nodes row:`, id);
 } else {
-  console.log('found existing provider_nodes row:', node.id);
+  console.log('provider_nodes row:', node.id, `(prefix=${node.prefix})`);
 }
 
-// ── 2. find the shim connection ───────────────────────────────────────────
-const conn = db.prepare(
-  `SELECT id, provider, provider_specific_data FROM provider_connections
-   WHERE provider_specific_data LIKE ? AND provider != ?`
-).get('%' + SHIM_BASE + '%', node.id);
-
-if (!conn) {
-  // fallback: any connection whose provider_specific_data has the shim base url
-  const conns = db.prepare(
-    `SELECT id, provider, provider_specific_data FROM provider_connections
-     WHERE provider_specific_data LIKE ?`
-  ).all('%' + SHIM_BASE + '%');
-  if (conns.length === 0) throw new Error('shim connection not found — create it via the dashboard first');
-  conn._fallbackList = conns;
-  conn.id = conns[0].id;
-  conn.provider = conns[0].provider;
-  conn.provider_specific_data = conns[0].provider_specific_data;
+// ── 2. connection.provider = node id ─────────────────────────────────────────
+const conns = db
+  .prepare('SELECT id, name, provider FROM provider_connections WHERE provider_specific_data LIKE ?')
+  .all('%' + SHIM_BASE + '%');
+if (conns.length === 0) {
+  throw new Error(
+    `no connection points at ${SHIM_BASE} — add it in the dashboard first ` +
+    '(OpenAI Compatible, base url ' + SHIM_BASE + ', any api key)');
 }
-
-console.log('shim connection id:', conn.id, 'provider:', conn.provider);
-
-// ── 3. fix connection.provider to match node id ───────────────────────────
-if (conn.provider !== node.id) {
-  const r = db.prepare(
-    `UPDATE provider_connections SET provider = ?, updated_at = ? WHERE id = ?`
-  ).run(node.id, new Date().toISOString(), conn.id);
-  console.log('updated provider field:', r.changes, 'row(s)');
+const conn = conns.find(c => c.provider === node.id) || conns[0];
+console.log('connection       :', conn.id, `(${conn.name})`);
+console.log('provider field   :', conn.provider);
+if (conn.provider === node.id) {
+  console.log('already aligned — nothing to do');
+} else if (DRY) {
+  console.log('would set provider field to:', node.id);
 } else {
-  console.log('provider field already correct');
+  const r = db
+    .prepare('UPDATE provider_connections SET provider = ?, updated_at = ? WHERE id = ?')
+    .run(node.id, new Date().toISOString(), conn.id);
+  console.log('provider field updated:', r.changes, 'row(s) →', node.id);
 }
 
-// ── 4. fix combo legs using old bare-slug model ids ──────────────────────
-const combos = db.prepare(`SELECT id, name, data FROM combos`).all();
-let legsFixed = 0;
-for (const combo of combos) {
+// ── 3. combo legs on the dead bare slug ──────────────────────────────────────
+let legs = 0;
+for (const combo of db.prepare('SELECT id, name, data FROM combos').all()) {
   let data;
   try { data = JSON.parse(combo.data); } catch { continue; }
   let changed = false;
-  for (const model of data.models || []) {
-    if (model.kind !== 'model') continue;
-    if (model.model && model.model.startsWith('openai-compatible-chat/')) {
-      const bare = model.model.slice('openai-compatible-chat/'.length);
-      model.model = node.id + '/' + bare;
-      model.providerId = node.id;
-      model.id = 'combo-' + combo.id + '-' + node.id + '-' + bare.replace(/[^a-zA-Z0-9]/g, '-');
-      changed = true;
-      legsFixed++;
-    }
+  for (const m of data.models || []) {
+    if (m.kind !== 'model' || typeof m.model !== 'string') continue;
+    if (!m.model.startsWith(LEGACY_SLUG + '/')) continue;
+    m.model = node.id + '/' + m.model.slice(LEGACY_SLUG.length + 1);
+    m.providerId = node.id;
+    changed = legs++;
   }
-  if (changed) {
-    data.updatedAt = new Date().toISOString();
-    db.prepare(`UPDATE combos SET data = ?, updated_at = ? WHERE id = ?`)
-      .run(JSON.stringify(data), data.updatedAt, combo.id);
-    console.log('fixed combo legs in:', combo.name);
+  if (!changed) continue;
+  const now = new Date().toISOString();
+  data.updatedAt = now;
+  if (!DRY) {
+    db.prepare('UPDATE combos SET data = ?, updated_at = ? WHERE id = ?')
+      .run(JSON.stringify(data), now, combo.id);
   }
+  console.log(`${DRY ? 'would fix' : 'fixed'} combo legs in:`, combo.name);
 }
-console.log('total legs fixed:', legsFixed);
+console.log('legs fixed:', legs);
+
 db.close();
-console.log('\nDone. Refresh /dashboard/providers?mode=configured to see the shim card.');
+if (!DRY) console.log('\nDone. Refresh /dashboard/providers?mode=configured — the shim card should appear.');

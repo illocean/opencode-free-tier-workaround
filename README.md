@@ -51,21 +51,25 @@ Creating the connection through the UI sets `provider = "openai-compatible-chat"
 This is exactly why `orcarouter` works: its connection `provider` is
 `openai-compatible-chat-4443a5b1-0908-482c-988a-ee162aafcfe5`, which *is* its node id.
 
-## Fix
+## Fix — `scripts/07-add-shim-provider.cjs`
 
 Point the connection at its node id. `provider` is **not** in
 `updateProviderConnectionSchema`, so `PUT /api/providers/{id}` cannot change it —
 the DB write function (`_02v77bl._.js` → `P()`) accepts it but the route never
-passes it. A direct SQLite write is the only path:
+passes it. A direct SQLite write is the only path. `storage.sqlite` runs in WAL
+mode, so writing from a second process while the server runs is safe; no restart.
 
-```js
-// scripts/08-fix-connection-provider-field.cjs
-db.prepare('UPDATE provider_connections SET provider = ? WHERE id = ?')
-  .run(nodeId, connectionId);
+```
+node scripts/07-add-shim-provider.cjs --dry   # report only, opens the DB readonly
+node scripts/07-add-shim-provider.cjs         # apply
 ```
 
-`storage.sqlite` runs in WAL mode, so writing from a second process while the
-server is running is safe. Restart not required.
+Three idempotent steps:
+
+1. find (or create) the `provider_nodes` row for `http://127.0.0.1:8791/v1`
+   (id `openai-compatible-chat-chat-<uuid>`, prefix `ocfree`)
+2. `UPDATE provider_connections SET provider = <node id> WHERE id = <shim conn>`
+3. rewrite any combo leg still on the dead bare slug `openai-compatible-chat/<model>`
 
 ## Fallout
 
@@ -75,10 +79,12 @@ Re-pointing the connection changes the routing key. The bare slug stops working:
 |---|---|
 | `ocfree/mimo-v2.6-flash-free` | 200 |
 | `openai-compatible-chat-b3760c9f-…/mimo-v2.6-flash-free` | 200 |
+| `openai-compatible-chat-b3760c9f-…/step-5-preview-free` | 200 |
 | `openai-compatible-chat/mimo-v2.6-flash-free` | 401 `No active credentials for provider: openai-compatible-chat` |
 
-Any combo leg still referencing `{providerId: "openai-compatible-chat"}` breaks.
-`scripts/09-fix-combo-legs.cjs` rewrites them to the node id.
+Any combo leg still referencing `{providerId: "openai-compatible-chat"}` breaks —
+step 3 above rewrites them. In combo `fries-in-the-bag` (7 legs) the shim leg is
+now `openai-compatible-chat-b3760c9f-…/step-5-preview-free`.
 
 ---
 
@@ -333,9 +339,7 @@ opencode-free-tier-workaround/
 │   ├── 05-patch-bridge.cjs       # globalThis bridge, both sides
 │   ├── 06-verify.cjs             # direct /v1/chat/completions smoke test
 │   ├── 06-dashboard-test.cjs     # dashboard /api/models/test smoke test
-│   ├── 07-add-shim-provider.cjs  # read-only dump of existing connections
-│   ├── 08-fix-connection-provider-field.cjs  # connection.provider = node id
-│   └── 09-fix-combo-legs.cjs               # rewrite combo legs to node ids
+│   └── 07-add-shim-provider.cjs  # shim wiring: node row + connection.provider + combo legs
 ├── chunks/
 │   ├── open-sse_1689v-3._.js     # reference copy of the patched executor
 │   ├── _1n6tsx0._.js             # reference copy of the patched header
@@ -346,8 +350,8 @@ opencode-free-tier-workaround/
 ```
 
 Steps 01–06 and `chunks/` are historical: they only apply to the superseded
-chunk-patch approach. For the shim path you need `shim/`, `scripts/08-*` and
-`scripts/09-*`.
+chunk-patch approach. For the shim path you need `shim/` and
+`scripts/07-add-shim-provider.cjs`.
 
 ---
 
@@ -420,51 +424,3 @@ https://opencode.ai/inference/v1/chat/completions
 That's it. The trickiest part is not the session mint — it's getting the session
 id across the async-context boundary between the executor and the header
 builder, which `globalThis` handles cleanly.
-
----
-
-## UPDATE (2026-10-15) — making the shim show up in `/dashboard/providers?mode=configured`
-
-The shim connection existed, but the dashboard's **configured** view filters
-every compatible entry by `connectionMatchesProviderCard`, which requires:
-
-1. a `provider_nodes` row for the entry (entries are built from
-   `buildCompatibleProviderGroups(providerNodes)` — no node, no card), and
-2. a `provider_connections` row whose `provider` field **exactly equals** that
-   node id (stats.total = count of matching connections; 0 → filtered out).
-
-The shim connection had `provider = "openai-compatible-chat"` (generic slug)
-while its node id was `openai-compatible-chat-b3760c9f-76ef-45cc-b29a-2e0f92af6b6b`
-— mismatch → 0 matches → card hidden. (Orcarouter works because its connection
-`provider` already equals its node id.)
-
-### Why this can't be done via the API
-
-`PUT /api/providers/{id}` uses `updateProviderConnectionSchema`, which has **no
-`provider` field** — it is immutable through the API. The DB layer
-(`updateProviderConnection` → `P()`) *does* write `provider = @provider`, so the
-only path is a direct SQLite update (`storage.sqlite`, WAL mode — safe while the
-server runs).
-
-### Fix — `scripts/07-add-shim-provider.cjs`
-
-1. Find/create the `provider_nodes` row (id `openai-compatible-chat-chat-<uuid>`,
-   prefix `ocfree`, baseUrl `http://127.0.0.1:8791/v1`).
-2. `UPDATE provider_connections SET provider = <node id> WHERE id = <shim conn>`.
-3. Sweep combo legs still using old bare-slug ids
-   (`openai-compatible-chat/<model>`) and rewrite them to
-   `<node id>/<model>` — after the rename, bare-slug ids 401 with
-   `No active credentials for provider: openai-compatible-chat.`
-
-Run: `node scripts/07-add-shim-provider.cjs` (shim must be running).
-
-### Verified
-
-| Model id | Result |
-|---|---|
-| `openai-compatible-chat-b3760c9f-…/mimo-v2.6-flash-free` | 200 |
-| `openai-compatible-chat-b3760c9f-…/step-5-preview-free` | 200 |
-| `ocfree/mimo-v2.6-flash-free` (prefix still resolves) | 200 |
-| `openai-compatible-chat/mimo-v2.6-flash-free` (old bare slug) | 401 — dead |
-
-Combo `fries-in-the-bag` leg updated to the node-scoped id; all 7 legs verified.
