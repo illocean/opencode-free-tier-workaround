@@ -17,6 +17,71 @@
 >
 > ---
 
+# Making the shim visible in the providers dashboard
+
+This is the **current** work. Everything further down this file documents the
+superseded chunk-patch approach.
+
+## Symptom
+
+After registering the shim as an OpenAI-compatible connection, requests route
+fine (`POST /v1/chat/completions` → 200) but the provider card never appears
+under `/dashboard/providers?mode=configured`.
+
+## Why
+
+The dashboard builds its "configured providers" list by pairing a **card** with
+the **connections** whose `provider` field equals the card's id:
+
+```
+buildCompatibleProviderGroups(providerNodes)            # cards, one per provider_nodes row
+  → eL(node.id)  # stats = connections where connectionBelongsToProviderCard(conn, node.id)
+    → getProviderConnectionFamilyIds(node.id).includes(conn.provider)
+  → filterConfiguredProviderEntries: keep only stats.total > 0
+```
+
+`getProviderConnectionFamilyIds(id)` is just `[id, ...aliases[id] ?? []]` — **exact
+id match, no prefix collapsing.** So a card is only shown if some connection's
+`provider` column literally equals the node id.
+
+Creating the connection through the UI sets `provider = "openai-compatible-chat"`
+(the generic slug), while `POST /api/provider-nodes` mints an id like
+`openai-compatible-chat-<uuid>`. Nothing matches, so the card is filtered out.
+
+This is exactly why `orcarouter` works: its connection `provider` is
+`openai-compatible-chat-4443a5b1-0908-482c-988a-ee162aafcfe5`, which *is* its node id.
+
+## Fix
+
+Point the connection at its node id. `provider` is **not** in
+`updateProviderConnectionSchema`, so `PUT /api/providers/{id}` cannot change it —
+the DB write function (`_02v77bl._.js` → `P()`) accepts it but the route never
+passes it. A direct SQLite write is the only path:
+
+```js
+// scripts/08-fix-connection-provider-field.cjs
+db.prepare('UPDATE provider_connections SET provider = ? WHERE id = ?')
+  .run(nodeId, connectionId);
+```
+
+`storage.sqlite` runs in WAL mode, so writing from a second process while the
+server is running is safe. Restart not required.
+
+## Fallout
+
+Re-pointing the connection changes the routing key. The bare slug stops working:
+
+| Model id | Result |
+|---|---|
+| `ocfree/mimo-v2.6-flash-free` | 200 |
+| `openai-compatible-chat-b3760c9f-…/mimo-v2.6-flash-free` | 200 |
+| `openai-compatible-chat/mimo-v2.6-flash-free` | 401 `No active credentials for provider: openai-compatible-chat` |
+
+Any combo leg still referencing `{providerId: "openai-compatible-chat"}` breaks.
+`scripts/09-fix-combo-legs.cjs` rewrites them to the node id.
+
+---
+
 # Making OmniRoute's OpenCode free-tier provider work (original fix, now superseded)
 
 This documents the full path from the original 403 to a working OpenCode
@@ -255,21 +320,34 @@ node 06-dashboard-test.cjs
 ```
 opencode-free-tier-workaround/
 ├── README.md              ← you are here
+├── shim/                  ← the current, supported solution
+│   ├── opencode-free-shim.cjs
+│   ├── start-shim.vbs / start-shim.cmd / launch-shim.cmd
+│   ├── autostart.sh
+│   ├── test-shim.cjs
+│   └── README.md
 ├── scripts/
 │   ├── 01-mint-test.cjs          # prove the session mint endpoint
 │   ├── 02-find-module.cjs        # locate module ids in chunks
 │   ├── 03-patch-executor.cjs     # fix TDZ in open-sse_1689v-3._.js
-│   ├── 04-patch-headers.cjs      # (legacy) header ctx fallback
 │   ├── 05-patch-bridge.cjs       # globalThis bridge, both sides
 │   ├── 06-verify.cjs             # direct /v1/chat/completions smoke test
-│   └── 06-dashboard-test.cjs     # dashboard /api/models/test smoke test
+│   ├── 06-dashboard-test.cjs     # dashboard /api/models/test smoke test
+│   ├── 07-add-shim-provider.cjs  # read-only dump of existing connections
+│   ├── 08-fix-connection-provider-field.cjs  # connection.provider = node id
+│   └── 09-fix-combo-legs.cjs               # rewrite combo legs to node ids
 ├── chunks/
 │   ├── open-sse_1689v-3._.js     # reference copy of the patched executor
-│   └── _1n6tsx0._.js             # reference copy of the patched header
+│   ├── _1n6tsx0._.js             # reference copy of the patched header
+│   └── _02g7gyp._.js             # reference copy of the patched header
 └── diagnostics/
     ├── _hdr_debug.log            # what module loaded, what ctxSid was
     └── _mint_debug.log           # mint calls, sid values, bridge writes
 ```
+
+Steps 01–06 and `chunks/` are historical: they only apply to the superseded
+chunk-patch approach. For the shim path you need `shim/`, `scripts/08-*` and
+`scripts/09-*`.
 
 ---
 
